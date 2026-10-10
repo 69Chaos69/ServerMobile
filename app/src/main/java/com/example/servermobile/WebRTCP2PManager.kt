@@ -22,7 +22,6 @@ import org.webrtc.PeerConnectionFactory
 import org.webrtc.RtpReceiver
 import org.webrtc.SdpObserver
 import org.webrtc.SessionDescription
-import java.io.File
 import java.nio.ByteBuffer
 import java.util.concurrent.ConcurrentHashMap
 import kotlin.coroutines.resume
@@ -191,7 +190,7 @@ class WebRTCP2PManager(
                     files.put(
                         JSONObject()
                                 .put("name", file.name)
-                                .put("size", file.length())
+                                .put("size", file.size)
                                 .put("isDirectory", file.isDirectory)
                                 .put("lastModified", metadata.lastModified)
                                 .put("creationTime", metadata.creationTime)
@@ -204,7 +203,7 @@ class WebRTCP2PManager(
                 requireAuthenticated(sessionId)
                 val name = message.getString("name")
                 val file = serverManager.getLocalFiles().firstOrNull {
-                    it.name == name && it.isFile && it.exists()
+                    it.name == name && it.isFile
                 } ?: error("Arquivo indisponível.")
                 sendFile(channel, file)
             }
@@ -216,21 +215,21 @@ class WebRTCP2PManager(
         check(sessionId in authenticatedClients) { "Cliente não autenticado." }
     }
 
-    private suspend fun sendFile(channel: DataChannel, file: File) {
+    private suspend fun sendFile(channel: DataChannel, file: SharedFile) {
         val metadata = serverManager.getFileMetadata(file)
         sendText(
             channel,
             JSONObject()
                 .put("type", "file_start")
                 .put("name", file.name)
-                .put("size", file.length())
+                .put("size", file.size)
                 .put("lastModified", metadata.lastModified)
                 .put("creationTime", metadata.creationTime)
                 .put("mimeType", metadata.mimeType)
                 .toString()
         )
 
-        file.inputStream().buffered().use { input ->
+        serverManager.openFileInput(file).buffered().use { input ->
             val bytes = ByteArray(FILE_CHUNK_SIZE)
             while (true) {
                 val count = input.read(bytes)

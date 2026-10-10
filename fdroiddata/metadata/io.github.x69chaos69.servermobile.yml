@@ -5,11 +5,16 @@ AuthorName: 69Chaos69
 SourceCode: https://github.com/69Chaos69/ServerMobile
 IssueTracker: https://github.com/69Chaos69/ServerMobile/issues
 
-Summary: Host and transfer files over local and peer-to-peer networks
+Summary: Share files over local HTTP, WebRTC, and BitTorrent
 Description: |-
-  Run a file server on an Android device and manage it from the app.
-  Share and transfer files over the local network, WebRTC peer-to-peer
-  connections, and BitTorrent discovery.
+  Select a folder to share from an Android device. Serve files over HTTP on the
+  local network, manually signaled WebRTC peer-to-peer connections, or
+  BitTorrent discovery.
+
+  The local HTTP server has no authentication or encryption. Devices on
+  the same network can access shared files and upload files. BitTorrent
+  magnets are public. Use these sharing features only with trusted
+  networks and content.
 
 RepoType: git
 Repo: https://github.com/69Chaos69/ServerMobile.git

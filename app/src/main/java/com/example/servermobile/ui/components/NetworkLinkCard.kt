@@ -59,6 +59,12 @@ fun NetworkLinkCard(
                         uriHandler.openUri("http://$ipAddress:$port")
                     }
                 )
+                Text(
+                    text = "HTTP sem senha ou criptografia: aparelhos na mesma rede podem acessar arquivos compartilhados e enviar arquivos.",
+                    color = TextSecondary,
+                    fontSize = 12.sp,
+                    modifier = Modifier.padding(top = 4.dp)
+                )
             }
             Spacer(modifier = Modifier.width(8.dp))
             Switch(

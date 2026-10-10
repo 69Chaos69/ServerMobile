@@ -1,25 +1,21 @@
 package com.example.servermobile
 
 import android.Manifest
+import android.app.AlertDialog
 import android.content.Context
-import android.content.Intent
-import android.content.pm.PackageManager
-import android.net.Uri
 import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.Bundle
-import android.os.Environment
-import android.provider.Settings
 import com.example.servermobile.AppLogger as Log
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.lifecycle.lifecycleScope
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
-import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import com.example.servermobile.ui.components.MainScreen
 import com.example.servermobile.ui.theme.ServerAppTheme
@@ -28,25 +24,66 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 class MainActivity : ComponentActivity() {
 
-    private val serverManager by lazy { ServerManager(applicationContext) }
-    private var webRTCManagerState = mutableStateOf<WebRTCP2PManager?>(null)
+    private val serverManager by lazy { ServerRuntime.serverManager(applicationContext) }
+    private var webRTCManagerState = mutableStateOf(ServerRuntime.currentWebRTCManager())
     
     // UI State
-    private var isLocalServerRunningState = mutableStateOf(false)
+    private var isLocalServerRunningState = mutableStateOf(ServerRuntime.isLocalServerRunning.value)
     private var isLocalServerTransitioningState = mutableStateOf(false)
-    private var isGlobalServerRunningState = mutableStateOf(false)
+    private var isGlobalServerRunningState = mutableStateOf(ServerRuntime.isGlobalServerRunning.value)
     private var ipAddressState = mutableStateOf("--")
-    private var serverKeyState = mutableStateOf(generateRandomKey())
+    private var serverKeyState = mutableStateOf("")
 
-    companion object {
-        private const val PERMISSION_REQUEST_CODE = 100
-        private var pendingAction: (() -> Unit)? = null
+    private enum class PendingStartAction { LOCAL, GLOBAL }
+    private var pendingStartAction: PendingStartAction? = null
+
+    private val notificationPermissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        if (!granted) {
+            Toast.makeText(
+                this,
+                "Sem permissão de notificações; o servidor ainda será iniciado.",
+                Toast.LENGTH_LONG
+            ).show()
+        }
+        runPendingStartAction()
+    }
+
+    private val sharedFolderPickerLauncher = registerForActivityResult(
+        ActivityResultContracts.OpenDocumentTree()
+    ) { uri ->
+        if (uri == null) {
+            pendingStartAction = null
+        } else {
+            lifecycleScope.launch {
+                val selected = withContext(Dispatchers.IO) {
+                    serverManager.useFolderAsShared(uri)
+                }
+                if (selected) {
+                    requestNotificationPermissionOrStart()
+                } else {
+                    pendingStartAction = null
+                    Toast.makeText(
+                        this@MainActivity,
+                        "Selecione uma pasta com permissões de leitura e gravação para iniciar o servidor.",
+                        Toast.LENGTH_LONG
+                    ).show()
+                }
+            }
+        }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         
         Log.init(this)
+        pendingStartAction = savedInstanceState?.getString(STATE_PENDING_START)
+            ?.let { runCatching { PendingStartAction.valueOf(it) }.getOrNull() }
+        serverKeyState.value = ServerRuntime.serverKey(this)
+        if (isLocalServerRunningState.value || isGlobalServerRunningState.value) {
+            ipAddressState.value = getLocalIpAddress()
+        }
         setContent {
             ServerAppTheme {
                 val activeConnections by serverManager.activeConnections.collectAsState()
@@ -65,7 +102,9 @@ class MainActivity : ComponentActivity() {
                     devices = devices,
                     serverManager = serverManager,
                     serverKey = serverKeyState.value,
-                    onRegenerateKey = { serverKeyState.value = generateRandomKey() },
+                    onRegenerateKey = {
+                        serverKeyState.value = ServerRuntime.regenerateServerKey(this)
+                    },
                     onToggleLocal = { toggleLocalServer() },
                     onToggleGlobal = { toggleGlobalServer() },
                     webRTCManager = webRTCManagerState.value
@@ -79,12 +118,7 @@ class MainActivity : ComponentActivity() {
         if (isLocalServerRunningState.value) {
             stopLocalServer()
         } else {
-            if (checkPermission()) {
-                startLocalServer()
-            } else {
-                pendingAction = { startLocalServer() }
-                requestPermission()
-            }
+            requestServerStart(PendingStartAction.LOCAL)
         }
     }
 
@@ -92,90 +126,52 @@ class MainActivity : ComponentActivity() {
         if (isGlobalServerRunningState.value) {
             stopGlobalServer()
         } else {
-            if (checkPermission()) {
-                startGlobalServer()
-            } else {
-                pendingAction = { startGlobalServer() }
-                requestPermission()
-            }
+            requestServerStart(PendingStartAction.GLOBAL)
         }
     }
 
-    private fun checkPermission(): Boolean {
-        val storagePermission = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            Environment.isExternalStorageManager()
+    private fun requestServerStart(action: PendingStartAction) {
+        pendingStartAction = action
+        if (serverManager.hasSharedFolder()) {
+            requestNotificationPermissionOrStart()
         } else {
-            val result = ContextCompat.checkSelfPermission(this, Manifest.permission.READ_EXTERNAL_STORAGE)
-            val result1 = ContextCompat.checkSelfPermission(this, Manifest.permission.WRITE_EXTERNAL_STORAGE)
-            result == PackageManager.PERMISSION_GRANTED && result1 == PackageManager.PERMISSION_GRANTED
+            AlertDialog.Builder(this)
+                .setTitle("Escolher pasta compartilhada")
+                .setMessage(
+                    "O conteúdo da pasta escolhida poderá ser listado e baixado por dispositivos que " +
+                        "se conectarem aos servidores iniciados. O servidor HTTP também permite enviar " +
+                        "arquivos para essa pasta. O app terá acesso somente à pasta autorizada por você."
+                )
+                .setNegativeButton("Cancelar") { _, _ -> pendingStartAction = null }
+                .setPositiveButton("Continuar") { _, _ -> sharedFolderPickerLauncher.launch(null) }
+                .show()
         }
+    }
 
-        val notificationPermission = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED
+    private fun requestNotificationPermissionOrStart() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) !=
+            android.content.pm.PackageManager.PERMISSION_GRANTED
+        ) {
+            notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
         } else {
-            true
-        }
-
-        return storagePermission && notificationPermission
-    }
-
-    private fun requestPermission() {
-        val permissions = mutableListOf<String>()
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            permissions.add(Manifest.permission.POST_NOTIFICATIONS)
-        }
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
-            permissions.add(Manifest.permission.READ_EXTERNAL_STORAGE)
-            permissions.add(Manifest.permission.WRITE_EXTERNAL_STORAGE)
-        }
-        
-        if (permissions.isNotEmpty()) {
-            ActivityCompat.requestPermissions(
-                this,
-                permissions.toTypedArray(),
-                PERMISSION_REQUEST_CODE
-            )
-        }
-
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && !Environment.isExternalStorageManager()) {
-            try {
-                val intent = Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION)
-                intent.addCategory("android.intent.category.DEFAULT")
-                intent.data = Uri.parse(String.format("package:%s", applicationContext.packageName))
-                startActivityForResult(intent, PERMISSION_REQUEST_CODE)
-            } catch (e: Exception) {
-                val intent = Intent()
-                intent.action = Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION
-                startActivityForResult(intent, PERMISSION_REQUEST_CODE)
-            }
+            runPendingStartAction()
         }
     }
 
-    @Deprecated("Deprecated in Java")
-    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
-        super.onActivityResult(requestCode, resultCode, data)
-        if (requestCode == PERMISSION_REQUEST_CODE) {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                if (Environment.isExternalStorageManager()) {
-                    pendingAction?.invoke()
-                    pendingAction = null
-                } else {
-                    Toast.makeText(this, "Permissão negada", Toast.LENGTH_SHORT).show()
-                }
-            }
+    private fun runPendingStartAction() {
+        val action = pendingStartAction
+        pendingStartAction = null
+        when (action) {
+            PendingStartAction.LOCAL -> startLocalServer()
+            PendingStartAction.GLOBAL -> startGlobalServer()
+            null -> Unit
         }
     }
 
-    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<String>, grantResults: IntArray) {
-        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
-        if (requestCode == PERMISSION_REQUEST_CODE) {
-            if (grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
-                pendingAction?.invoke()
-                pendingAction = null
-            } else {
-                Toast.makeText(this, "Permissão negada", Toast.LENGTH_SHORT).show()
-            }
-        }
+    override fun onSaveInstanceState(outState: Bundle) {
+        pendingStartAction?.let { outState.putString(STATE_PENDING_START, it.name) }
+        super.onSaveInstanceState(outState)
     }
 
     private fun startLocalServer() {
@@ -183,11 +179,17 @@ class MainActivity : ComponentActivity() {
         lifecycleScope.launch {
             isLocalServerTransitioningState.value = true
             try {
-                withContext(Dispatchers.IO) { serverManager.startServer() }
+                ServerService.startService(this@MainActivity)
+                withContext(Dispatchers.IO) {
+                    serverManager.startServer()
+                    ServerRuntime.isLocalServerRunning.value = serverManager.isRunning
+                }
                 isLocalServerRunningState.value = true
                 ipAddressState.value = getLocalIpAddress()
-                ServerService.startService(this@MainActivity)
             } catch (e: Exception) {
+                if (!isGlobalServerRunningState.value) {
+                    ServerService.stopService(this@MainActivity)
+                }
                 Toast.makeText(
                     this@MainActivity,
                     "Erro ao iniciar o servidor local: ${e.message}",
@@ -204,7 +206,10 @@ class MainActivity : ComponentActivity() {
         lifecycleScope.launch {
             isLocalServerTransitioningState.value = true
             try {
-                withContext(Dispatchers.IO) { serverManager.stopServer() }
+                withContext(Dispatchers.IO) {
+                    serverManager.stopServer()
+                    ServerRuntime.isLocalServerRunning.value = serverManager.isRunning
+                }
                 isLocalServerRunningState.value = false
                 if (!isGlobalServerRunningState.value) {
                     ipAddressState.value = "--"
@@ -224,38 +229,36 @@ class MainActivity : ComponentActivity() {
 
     private fun startGlobalServer() {
         try {
-            webRTCManagerState.value?.close()
-            webRTCManagerState.value = WebRTCP2PManager(
-                applicationContext,
+            webRTCManagerState.value = ServerRuntime.startWebRTCServer(
+                this,
                 serverManager,
                 serverKeyState.value
             )
             
-            isGlobalServerRunningState.value = true
-            ipAddressState.value = getLocalIpAddress()
             ServerService.startService(this)
+            isGlobalServerRunningState.value = true
+            ServerRuntime.isGlobalServerRunning.value = true
+            ipAddressState.value = getLocalIpAddress()
             serverManager.addLog("P2P: servidor WebRTC iniciado. Aguardando oferta manual.")
         } catch (e: Throwable) {
+            ServerRuntime.stopWebRTCServer()
+            webRTCManagerState.value = null
+            if (!isLocalServerRunningState.value) {
+                ServerService.stopService(this)
+            }
             Log.e("MainActivity", "Erro P2P", e)
             Toast.makeText(this, "Erro ao iniciar o servidor P2P: ${e.message}", Toast.LENGTH_LONG).show()
         }
     }
 
     private fun stopGlobalServer() {
-        webRTCManagerState.value?.close()
+        ServerRuntime.stopWebRTCServer()
         webRTCManagerState.value = null
-
         isGlobalServerRunningState.value = false
         if (!isLocalServerRunningState.value) {
             ipAddressState.value = "--"
             ServerService.stopService(this)
         }
-    }
-
-    override fun onDestroy() {
-        webRTCManagerState.value?.close()
-        webRTCManagerState.value = null
-        super.onDestroy()
     }
 
     private fun getLocalIpAddress(): String {
@@ -270,8 +273,8 @@ class MainActivity : ComponentActivity() {
         )
     }
 
-    private fun generateRandomKey(): String {
-        val chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-        return (1..6).map { chars.random() }.joinToString("")
+    companion object {
+        private const val STATE_PENDING_START = "pending_server_start"
     }
+
 }

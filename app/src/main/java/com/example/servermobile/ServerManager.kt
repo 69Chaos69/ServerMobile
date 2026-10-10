@@ -2,8 +2,7 @@ package com.example.servermobile
 
 import android.content.Context
 import android.net.Uri
-import android.os.Environment
-import android.provider.DocumentsContract
+import androidx.documentfile.provider.DocumentFile
 import io.ktor.http.*
 import io.ktor.http.content.*
 import io.ktor.server.http.content.*
@@ -25,10 +24,8 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.withContext
 import java.io.File
-import java.io.RandomAccessFile
-import java.nio.file.attribute.BasicFileAttributes
-import java.nio.file.FileAlreadyExistsException
-import java.nio.file.Files
+import java.io.FileOutputStream
+import java.io.InputStream
 import java.time.Instant
 import java.time.ZoneOffset
 import java.time.format.DateTimeFormatter
@@ -54,11 +51,25 @@ data class SharedFileMetadata(
     val mimeType: String
 )
 
+data class SharedFile(
+    val document: DocumentFile,
+    val relativePath: String
+) {
+    val name: String get() = document.name ?: relativePath.substringAfterLast('/')
+    val isDirectory: Boolean get() = document.isDirectory
+    val isFile: Boolean get() = document.isFile
+    val size: Long get() = document.length()
+}
+
 class ServerManager(context: Context) {
 
-    private val preferences = context.applicationContext.getSharedPreferences("server_settings", Context.MODE_PRIVATE)
+    private val appContext = context.applicationContext
+    private val contentResolver = appContext.contentResolver
+    private val preferences = appContext.getSharedPreferences("server_settings", Context.MODE_PRIVATE)
 
+    @Volatile
     private var server: EmbeddedServer<NettyApplicationEngine, NettyApplicationEngine.Configuration>? = null
+    val isRunning: Boolean get() = server != null
 
     private val _settings = MutableStateFlow(
         ServerSettings(
@@ -102,132 +113,134 @@ class ServerManager(context: Context) {
     private var nextUploadNanos = 0L
     private var totalUploadedBytes = 0L
 
-    private val serverFolder: File
-        get() {
-            val configuredPath = preferences.getString("shared_folder_path", null)
-            return configuredPath?.takeIf { it.isNotBlank() }?.let(::File)
-                ?: defaultServerFolder()
-        }
+    private val sharedTreeUri: Uri?
+        get() = preferences.getString("shared_folder_uri", null)?.let(Uri::parse)
 
-    private fun defaultServerFolder(): File =
-        File(
-            Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS),
-            "ServerMobile"
-        )
+    private fun requireSharedFolder(): DocumentFile =
+        sharedTreeUri?.let { DocumentFile.fromTreeUri(appContext, it) }
+            ?.takeIf { it.isDirectory }
+            ?: error("Escolha uma pasta compartilhada antes de iniciar o servidor.")
 
     private fun excludedSharedPaths(): Set<String> =
         preferences.getStringSet("excluded_shared_paths", emptySet()) ?: emptySet()
 
-    private fun isExcludedFromSharing(file: File): Boolean {
-        val path = file.canonicalPath
-        return excludedSharedPaths().any { excludedPath ->
-            path == excludedPath || path.startsWith(excludedPath + File.separator)
+    private fun isExcludedFromSharing(file: SharedFile): Boolean =
+        excludedSharedPaths().any { excludedPath ->
+            file.relativePath == excludedPath || file.relativePath.startsWith("$excludedPath/")
         }
-    }
 
-    private fun removeExcludedPath(file: File) {
-        val path = file.canonicalPath
+    private fun removeExcludedPath(file: SharedFile) {
+        val path = file.relativePath
         val updatedPaths = excludedSharedPaths()
-            .filterNot { it == path || it.startsWith(path + File.separator) }
+            .filterNot { it == path || it.startsWith("$path/") }
             .toSet()
         preferences.edit().putStringSet("excluded_shared_paths", updatedPaths).apply()
     }
 
-    private fun mimeTypePreferenceKey(file: File): String =
-        "file_mime:${file.canonicalPath}"
+    private fun metadataPreferenceKey(type: String, file: SharedFile): String =
+        "file_${type}:${file.relativePath}"
 
-    private fun saveMimeType(file: File, mimeType: String?) {
+    private fun saveFileMetadata(
+        file: SharedFile,
+        mimeType: String?,
+        lastModified: Long?,
+        creationTime: Long?
+    ) {
         val editor = preferences.edit()
         if (mimeType.isNullOrBlank()) {
-            editor.remove(mimeTypePreferenceKey(file))
+            editor.remove(metadataPreferenceKey("mime", file))
         } else {
-            editor.putString(mimeTypePreferenceKey(file), mimeType)
+            editor.putString(metadataPreferenceKey("mime", file), mimeType)
         }
+        if (lastModified == null) editor.remove(metadataPreferenceKey("last_modified", file))
+        else editor.putLong(metadataPreferenceKey("last_modified", file), lastModified)
+        if (creationTime == null) editor.remove(metadataPreferenceKey("creation_time", file))
+        else editor.putLong(metadataPreferenceKey("creation_time", file), creationTime)
         editor.apply()
     }
 
-    private fun removeMimeTypes(file: File) {
-        val pathPrefix = mimeTypePreferenceKey(file)
+    private fun removeFileMetadata(file: SharedFile) {
+        val relativePath = file.relativePath
         val editor = preferences.edit()
         preferences.all.keys
-            .filter { it == pathPrefix || it.startsWith("$pathPrefix${File.separator}") }
+            .filter { key ->
+                val path = key.substringAfter(':', "")
+                key.startsWith("file_") &&
+                    (path == relativePath || path.startsWith("$relativePath/"))
+            }
             .forEach(editor::remove)
         editor.apply()
     }
 
-    fun getFileMetadata(file: File): SharedFileMetadata {
-        val attributes = Files.readAttributes(file.toPath(), BasicFileAttributes::class.java)
+    fun getFileMetadata(file: SharedFile): SharedFileMetadata {
+        val modified = preferences.getLong(
+            metadataPreferenceKey("last_modified", file),
+            file.document.lastModified()
+        )
         return SharedFileMetadata(
-            lastModified = attributes.lastModifiedTime().toMillis(),
-            creationTime = attributes.creationTime().toMillis(),
-            mimeType = preferences.getString(mimeTypePreferenceKey(file), null)
+            lastModified = modified,
+            creationTime = preferences.getLong(metadataPreferenceKey("creation_time", file), modified),
+            mimeType = preferences.getString(metadataPreferenceKey("mime", file), null)
                 ?.takeUnless { it == ContentType.Application.OctetStream.toString() }
-                ?: getMimeType(file)
+                ?: file.document.type
+                ?: ContentType.Application.OctetStream.toString()
         )
     }
 
-    private fun applyFileTimes(file: File, lastModified: Long?, creationTime: Long?) {
-        if (lastModified != null && !file.setLastModified(lastModified)) {
-            addLog("Aviso: não foi possível manter a data de modificação de ${file.name}")
-        }
-        if (creationTime != null) {
-            try {
-                val view = Files.getFileAttributeView(
-                    file.toPath(),
-                    java.nio.file.attribute.BasicFileAttributeView::class.java
-                )
-                view.setTimes(
-                    null,
-                    null,
-                    java.nio.file.attribute.FileTime.fromMillis(creationTime)
-                )
-            } catch (e: Exception) {
-                addLog("Aviso: o armazenamento não permite manter a data de criação de ${file.name}")
-            }
+    fun getSharedFolderPath(): String =
+        preferences.getString("shared_folder_name", null) ?: "Nenhuma pasta selecionada"
+
+    fun hasSharedFolder(): Boolean {
+        val uri = sharedTreeUri ?: return false
+        return contentResolver.persistedUriPermissions.any {
+            it.uri == uri && it.isReadPermission && it.isWritePermission
         }
     }
 
-    fun getSharedFolderPath(): String = serverFolder.absolutePath
-
     fun useFolderAsShared(treeUri: Uri): Boolean {
-        if (treeUri.authority != "com.android.externalstorage.documents") return false
-
+        val previousUri = sharedTreeUri
         return try {
-            val documentId = DocumentsContract.getTreeDocumentId(treeUri)
-            val separator = documentId.indexOf(':')
-            if (separator <= 0) return false
-
-            val volume = documentId.substring(0, separator)
-            val relativePath = documentId.substring(separator + 1)
-            if (volume != "primary" && !volume.matches(Regex("[A-Za-z0-9_-]+"))) return false
-            val pathParts = relativePath.split('/').filter { it.isNotEmpty() }
-            if (pathParts.any { it == "." || it == ".." || it.contains('\\') }) return false
-
-            val volumeRoot = if (volume == "primary") {
-                Environment.getExternalStorageDirectory()
-            } else {
-                File("/storage", volume)
-            }.canonicalFile
-            val selectedFolder = File(volumeRoot, relativePath).canonicalFile
-            if (!selectedFolder.isDirectory ||
-                (selectedFolder != volumeRoot &&
-                    !selectedFolder.path.startsWith(volumeRoot.path + File.separator))
-            ) {
+            contentResolver.takePersistableUriPermission(
+                treeUri,
+                android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION or
+                    android.content.Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+            )
+            val folder = DocumentFile.fromTreeUri(appContext, treeUri)
+            if (folder == null || !folder.isDirectory || !folder.canRead() || !folder.canWrite()) {
+                if (previousUri != treeUri) releaseFolderGrant(treeUri)
                 return false
             }
-
-            preferences.edit().putString("shared_folder_path", selectedFolder.path).apply()
+            preferences.edit()
+                .putString("shared_folder_uri", treeUri.toString())
+                .putString("shared_folder_name", folder.name)
+                .apply()
+            if (previousUri != null && previousUri != treeUri) {
+                releaseFolderGrant(previousUri)
+            }
             true
         } catch (e: Exception) {
-            e.printStackTrace()
+            if (previousUri != treeUri) releaseFolderGrant(treeUri)
+            addLog("Falha ao conceder acesso à pasta: ${e.message}")
             false
+        }
+    }
+
+    private fun releaseFolderGrant(uri: Uri) {
+        try {
+            val grant = contentResolver.persistedUriPermissions.firstOrNull { it.uri == uri } ?: return
+            var flags = 0
+            if (grant.isReadPermission) flags = flags or android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION
+            if (grant.isWritePermission) flags = flags or android.content.Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+            if (flags != 0) contentResolver.releasePersistableUriPermission(uri, flags)
+        } catch (error: Exception) {
+            addLog("Não foi possível revogar o acesso antigo à pasta: ${error.message}")
         }
     }
 
     fun addLog(message: String) {
         val currentLogs = _logs.value.toMutableList()
         currentLogs.add(0, "[${getCurrentTime()}] $message")
-        if (currentLogs.size > 100) currentLogs.removeLast()
+        if (currentLogs.size > 100) currentLogs.removeAt(currentLogs.lastIndex)
         _logs.value = currentLogs
     }
 
@@ -244,13 +257,10 @@ class ServerManager(context: Context) {
         _settings.value = settings
     }
 
+    @Synchronized
     fun startServer(port: Int = _settings.value.port) {
         if (server != null) return
-
-        // Garantir que a pasta existe
-        if (!serverFolder.exists()) {
-            serverFolder.mkdirs()
-        }
+        requireSharedFolder()
 
         _serverStartTime.value = System.currentTimeMillis()
         _logs.value = listOf("[${getCurrentTime()}] Servidor iniciado na porta $port")
@@ -315,33 +325,37 @@ class ServerManager(context: Context) {
                 get("/api/files") {
                     val directory = withContext(Dispatchers.IO) {
                         resolveSharedPath(call.request.queryParameters["path"])
+                            ?.takeIf { it.isDirectory }
                     }
-                    if (directory == null || !directory.isDirectory) {
+                    if (directory == null) {
                         call.respond(HttpStatusCode.NotFound, "Pasta não encontrada")
                         return@get
                     }
                     val files = withContext(Dispatchers.IO) {
-                        directory.listFiles()?.map {
-                            if (isExcludedFromSharing(it)) return@map null
-                            val metadata = getFileMetadata(it)
+                        listChildren(directory).map { child ->
+                            val metadata = getFileMetadata(child)
                             mapOf(
-                                "name" to it.name,
-                                "isDirectory" to it.isDirectory,
-                                "size" to it.length(),
-                                "mimeType" to if (it.isDirectory) "" else metadata.mimeType,
+                                "name" to child.name,
+                                "isDirectory" to child.isDirectory,
+                                "size" to child.size,
+                                "mimeType" to if (child.isDirectory) "" else metadata.mimeType,
                                 "lastModified" to metadata.lastModified,
                                 "creationTime" to metadata.creationTime
                             )
-                        }?.filterNotNull()
-                    } ?: emptyList()
+                        }
+                    }
                     call.respond(files)
                 }
 
-                // Browser uploads always go to the app's default Downloads folder.
+                // Browser uploads go to the root of the folder selected by the user.
                 post("/api/upload") {
                     val fileName = call.request.queryParameters["filename"]
                     if (fileName == null || !isValidChildName(fileName)) {
                         call.respond(HttpStatusCode.BadRequest, "Nome de arquivo inválido")
+                        return@post
+                    }
+                    if (fileName.startsWith(TEMP_UPLOAD_PREFIX)) {
+                        call.respond(HttpStatusCode.BadRequest, "Nome de arquivo reservado")
                         return@post
                     }
                     val sourceLastModified = call.request.headers["X-File-Last-Modified"]
@@ -364,44 +378,43 @@ class ServerManager(context: Context) {
                         return@post
                     }
 
-                    val directory = withContext(Dispatchers.IO) {
-                        defaultServerFolder().also {
-                            if (!it.exists()) it.mkdirs()
-                        }
-                    }
-                    if (!directory.isDirectory) {
-                        call.respond(HttpStatusCode.InternalServerError, "Não foi possível criar a pasta de destino")
-                        return@post
-                    }
-
-                    val destination = File(directory, fileName)
-                    if (destination.exists()) {
+                    val directory = withContext(Dispatchers.IO) { requireSharedFolder() }
+                    if (withContext(Dispatchers.IO) { directory.findFile(fileName) != null }) {
                         call.respond(HttpStatusCode.Conflict, "Já existe um arquivo com esse nome")
                         return@post
                     }
 
-                    var temporaryFile: File? = null
+                    var temporaryFile: DocumentFile? = null
                     try {
                         val uploadFile = withContext(Dispatchers.IO) {
-                            File.createTempFile(".up-", ".part", directory)
-                        }
+                            directory.createFile(
+                                sourceMimeType ?: ContentType.Application.OctetStream.toString(),
+                                "$TEMP_UPLOAD_PREFIX${java.util.UUID.randomUUID()}.part"
+                            )
+                        } ?: error("Não foi possível criar o arquivo temporário.")
                         temporaryFile = uploadFile
                         call.receiveStream().use { input ->
                             withContext(Dispatchers.IO) {
-                                uploadFile.outputStream().buffered(64 * 1024).use { output ->
+                                contentResolver.openOutputStream(uploadFile.uri, "w")
+                                    ?.buffered(64 * 1024)?.use { output ->
                                     input.copyTo(output, bufferSize = 64 * 1024)
-                                }
+                                } ?: error("Não foi possível abrir o arquivo para gravação.")
                             }
                         }
-                        withContext(Dispatchers.IO) {
-                            Files.move(uploadFile.toPath(), destination.toPath())
-                            applyFileTimes(destination, sourceLastModified, null)
-                            saveMimeType(destination, sourceMimeType)
+                        if (!withContext(Dispatchers.IO) { uploadFile.renameTo(fileName) }) {
+                            error("Não foi possível finalizar o arquivo enviado.")
                         }
-                        addLog("Arquivo recebido: ${destination.relativeTo(directory).path}")
+                        temporaryFile = null
+                        val destination = withContext(Dispatchers.IO) { directory.findFile(fileName) }
+                            ?: error("O arquivo enviado não foi encontrado após a gravação.")
+                        saveFileMetadata(
+                            SharedFile(destination, fileName),
+                            sourceMimeType,
+                            sourceLastModified,
+                            null
+                        )
+                        addLog("Arquivo recebido: $fileName")
                         call.respond(HttpStatusCode.Created, "Arquivo enviado")
-                    } catch (_: FileAlreadyExistsException) {
-                        call.respond(HttpStatusCode.Conflict, "Já existe um arquivo com esse nome")
                     } catch (e: Exception) {
                         addLog("Falha ao receber $fileName: ${e.message ?: "erro desconhecido"}")
                         call.respond(HttpStatusCode.InternalServerError, "Não foi possível salvar o arquivo")
@@ -417,10 +430,10 @@ class ServerManager(context: Context) {
                         call.respond(HttpStatusCode.BadRequest, "Nome de arquivo não fornecido")
                         return@get
                     }
-                    val file = withContext(Dispatchers.IO) { resolveSharedPath(path) }
-                    if (file != null && file.exists() && !file.isDirectory &&
-                        !withContext(Dispatchers.IO) { isExcludedFromSharing(file) }
-                    ) {
+                    val file = withContext(Dispatchers.IO) {
+                        resolveSharedPath(path)?.takeIf { it.isFile && !isExcludedFromSharing(it) }
+                    }
+                    if (file != null) {
                         respondFile(call, file, attachment = true)
                     } else {
                         call.respond(HttpStatusCode.NotFound, "Arquivo não encontrado")
@@ -434,10 +447,10 @@ class ServerManager(context: Context) {
                         call.respond(HttpStatusCode.BadRequest, "Nome de arquivo não fornecido")
                         return@get
                     }
-                    val file = withContext(Dispatchers.IO) { resolveSharedPath(path) }
-                    if (file != null && file.exists() && !file.isDirectory &&
-                        !withContext(Dispatchers.IO) { isExcludedFromSharing(file) }
-                    ) {
+                    val file = withContext(Dispatchers.IO) {
+                        resolveSharedPath(path)?.takeIf { it.isFile && !isExcludedFromSharing(it) }
+                    }
+                    if (file != null) {
                         respondFile(call, file)
                     } else {
                         call.respond(HttpStatusCode.NotFound, "Arquivo não encontrado")
@@ -449,10 +462,10 @@ class ServerManager(context: Context) {
                     val filename = call.parameters["filename"] ?: return@get call.respond(
                         HttpStatusCode.BadRequest, "Nome de arquivo não fornecido"
                     )
-                    val file = withContext(Dispatchers.IO) { resolveSharedPath(filename) }
-                    if (file != null && file.exists() && file.isFile &&
-                        !withContext(Dispatchers.IO) { isExcludedFromSharing(file) }
-                    ) {
+                    val file = withContext(Dispatchers.IO) {
+                        resolveSharedPath(filename)?.takeIf { it.isFile && !isExcludedFromSharing(it) }
+                    }
+                    if (file != null) {
                         respondFile(call, file, attachment = true)
                     } else {
                         call.respond(HttpStatusCode.NotFound, "Arquivo não encontrado")
@@ -462,10 +475,10 @@ class ServerManager(context: Context) {
                     val filename = call.parameters["filename"] ?: return@get call.respond(
                         HttpStatusCode.BadRequest, "Nome de arquivo não fornecido"
                     )
-                    val file = withContext(Dispatchers.IO) { resolveSharedPath(filename) }
-                    if (file != null && file.exists() && file.isFile &&
-                        !withContext(Dispatchers.IO) { isExcludedFromSharing(file) }
-                    ) {
+                    val file = withContext(Dispatchers.IO) {
+                        resolveSharedPath(filename)?.takeIf { it.isFile && !isExcludedFromSharing(it) }
+                    }
+                    if (file != null) {
                         respondFile(call, file)
                     } else {
                         call.respond(HttpStatusCode.NotFound, "Arquivo não encontrado")
@@ -487,6 +500,7 @@ class ServerManager(context: Context) {
         _runningPort.value = port
     }
 
+    @Synchronized
     fun stopServer() {
         server?.stop(1000, 2000)
         server = null
@@ -571,10 +585,12 @@ class ServerManager(context: Context) {
 
     private suspend fun respondFile(
         call: ApplicationCall,
-        file: File,
+        file: SharedFile,
         attachment: Boolean = false
     ) {
-        val size = file.length()
+        val (size, metadata, fileName) = withContext(Dispatchers.IO) {
+            Triple(file.size, getFileMetadata(file), file.name)
+        }
         val rangeHeader = call.request.headers[HttpHeaders.Range]
         val range = rangeHeader?.let { parseByteRange(it, size) }
         if (rangeHeader != null && range == null) {
@@ -587,7 +603,6 @@ class ServerManager(context: Context) {
         val end = range?.last ?: (size - 1L)
         val responseLength = if (size == 0L) 0L else end - start + 1L
         val status = if (range == null) HttpStatusCode.OK else HttpStatusCode.PartialContent
-        val metadata = withContext(Dispatchers.IO) { getFileMetadata(file) }
         val mimeType = metadata.mimeType
         val lastModifiedHeader = DateTimeFormatter.RFC_1123_DATE_TIME
             .withZone(ZoneOffset.UTC)
@@ -605,7 +620,7 @@ class ServerManager(context: Context) {
                     append(
                         HttpHeaders.ContentDisposition,
                         ContentDisposition.Attachment
-                            .withParameter(ContentDisposition.Parameters.FileName, file.name)
+                            .withParameter(ContentDisposition.Parameters.FileName, fileName)
                             .toString()
                     )
                 }
@@ -613,8 +628,8 @@ class ServerManager(context: Context) {
 
             override suspend fun writeTo(channel: ByteWriteChannel) {
                 withContext(Dispatchers.IO) {
-                    RandomAccessFile(file, "r").use { input ->
-                        input.seek(start)
+                    openFileInput(file).buffered(64 * 1024).use { input ->
+                        skipFully(input, start)
                         var remaining = responseLength
                         val buffer = ByteArray(64 * 1024)
                         while (remaining > 0L) {
@@ -661,67 +676,78 @@ class ServerManager(context: Context) {
         return first..end
     }
 
+    private fun skipFully(input: InputStream, byteCount: Long) {
+        var remaining = byteCount
+        while (remaining > 0L) {
+            val skipped = input.skip(remaining)
+            if (skipped > 0L) {
+                remaining -= skipped
+            } else {
+                if (input.read() < 0) error("O arquivo terminou antes do intervalo solicitado.")
+                remaining--
+            }
+        }
+    }
+
     private fun getCurrentTime(): String {
         return SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date())
     }
 
-    private fun getMimeType(file: File): String {
-        val extension = file.extension.lowercase(Locale.getDefault())
-        val mimeMap = mapOf(
-            "mp4" to "video/mp4",
-            "mkv" to "video/x-matroska",
-            "webm" to "video/webm",
-            "mp3" to "audio/mpeg",
-            "wav" to "audio/wav",
-            "ogg" to "audio/ogg",
-            "jpg" to "image/jpeg",
-            "jpeg" to "image/jpeg",
-            "png" to "image/png",
-            "gif" to "image/gif",
-            "svg" to "image/svg+xml",
-            "pdf" to "application/pdf"
-        )
-        if (mimeMap.containsKey(extension)) return mimeMap[extension]!!
-
-        try {
-            val bytes = ByteArray(32)
-            file.inputStream().buffered().use { it.read(bytes) }
-            
-            if (bytes.size >= 4 && bytes[0] == '%'.code.toByte() && bytes[1] == 'P'.code.toByte() && bytes[2] == 'D'.code.toByte() && bytes[3] == 'F'.code.toByte()) return "application/pdf"
-            if (bytes.size >= 8 && bytes[0] == 0x89.toByte() && bytes[1] == 0x50.toByte()) return "image/png"
-            if (bytes.size >= 2 && bytes[0] == 0xFF.toByte() && bytes[1] == 0xD8.toByte()) return "image/jpeg"
-            if (bytes.size >= 3 && bytes[0] == 'G'.code.toByte() && bytes[1] == 'I'.code.toByte() && bytes[2] == 'F'.code.toByte()) return "image/gif"
-            
-            val header = String(bytes, Charsets.ISO_8859_1)
-            if (header.contains("ftyp")) return "video/mp4"
-            if (header.contains("matroska") || header.contains("webm")) return "video/webm"
-            
-            if (bytes.size >= 3 && bytes[0] == 'I'.code.toByte() && bytes[1] == 'D'.code.toByte() && bytes[2] == '3'.code.toByte()) return "audio/mpeg"
-        } catch (e: Exception) {
-            e.printStackTrace()
-        }
-        
-        return "application/octet-stream"
+    fun getLocalFiles(): List<SharedFile> {
+        if (sharedTreeUri == null) return emptyList()
+        val folder = requireSharedFolder()
+        return listChildren(SharedFile(folder, ""))
     }
 
-    fun getLocalFiles(): List<File> {
-        return serverFolder.listFiles()?.filterNot(::isExcludedFromSharing) ?: emptyList()
+    private fun listChildren(directory: SharedFile): List<SharedFile> =
+        directory.document.listFiles().mapNotNull { document ->
+            val name = document.name ?: return@mapNotNull null
+            if (!isValidChildName(name) || name.startsWith(TEMP_UPLOAD_PREFIX)) return@mapNotNull null
+            val path = if (directory.relativePath.isEmpty()) name else "${directory.relativePath}/$name"
+            SharedFile(document, path).takeUnless(::isExcludedFromSharing)
+        }
+
+    fun openFileInput(file: SharedFile): InputStream =
+        contentResolver.openInputStream(file.document.uri)
+            ?: error("Não foi possível abrir ${file.name} para leitura.")
+
+    fun copyToPrivateFile(source: SharedFile, destination: File) {
+        require(source.isFile || source.isDirectory) { "O item compartilhado não está disponível." }
+        if (source.isDirectory) {
+            check(!destination.exists() && destination.mkdirs()) {
+                "Não foi possível criar a pasta temporária para o BitTorrent."
+            }
+            listChildren(source).forEach { child ->
+                copyToPrivateFile(child, File(destination, child.name))
+            }
+        } else {
+            check(!destination.exists()) { "O destino temporário já existe." }
+            destination.parentFile?.let { parent ->
+                check(parent.exists() || parent.mkdirs()) {
+                    "Não foi possível criar a pasta temporária para o BitTorrent."
+                }
+            }
+            openFileInput(source).buffered().use { input ->
+                FileOutputStream(destination).buffered().use { output ->
+                    input.copyTo(output, bufferSize = 64 * 1024)
+                }
+            }
+        }
     }
 
     fun deleteLocalFile(fileName: String, deleteFromStorage: Boolean): Boolean {
         val file = resolveSharedPath(fileName) ?: return false
-        if (!file.exists()) return false
         if (!deleteFromStorage) {
             val updatedPaths = excludedSharedPaths().toMutableSet().apply {
-                add(file.canonicalPath)
+                add(file.relativePath)
             }
             preferences.edit().putStringSet("excluded_shared_paths", updatedPaths).apply()
             return true
         }
-        val deleted = file.deleteRecursively()
+        val deleted = file.document.delete()
         if (deleted) {
             removeExcludedPath(file)
-            removeMimeTypes(file)
+            removeFileMetadata(file)
         }
         return deleted
     }
@@ -731,13 +757,43 @@ class ServerManager(context: Context) {
         if (newName.isBlank() || newName == "." || newName == ".." ||
             newName.contains('/') || newName.contains('\\')
         ) return false
-        val newFile = resolveSharedPath(newName) ?: return false
-        if (!oldFile.exists() || newFile.exists()) return false
-        val mimeType = preferences.getString(mimeTypePreferenceKey(oldFile), null)
-        val renamed = oldFile.renameTo(newFile)
-        if (renamed && mimeType != null) {
-            saveMimeType(oldFile, null)
-            saveMimeType(newFile, mimeType)
+        val parentPath = oldFile.relativePath.substringBeforeLast('/', "")
+        val newPath = if (parentPath.isEmpty()) newName else "$parentPath/$newName"
+        val root = requireSharedFolder()
+        val parent = if (parentPath.isEmpty()) root else resolveSharedPath(parentPath)?.document
+            ?: return false
+        if (parent.findFile(newName) != null) return false
+
+        val metadataToMove = preferences.all.filterKeys { key ->
+            val path = key.substringAfter(':', "")
+            key.startsWith("file_") && (
+                path == oldFile.relativePath || path.startsWith("${oldFile.relativePath}/")
+            )
+        }
+        val excludedToMove = excludedSharedPaths()
+            .filter { it == oldFile.relativePath || it.startsWith("${oldFile.relativePath}/") }
+        val renamed = oldFile.document.renameTo(newName)
+        if (renamed) {
+            val editor = preferences.edit()
+            metadataToMove.forEach { (key, value) ->
+                val type = key.substringBefore(':')
+                val path = key.substringAfter(':')
+                val destinationKey = "$type:$newPath${path.removePrefix(oldFile.relativePath)}"
+                editor.remove(key)
+                when (value) {
+                    is String -> editor.putString(destinationKey, value)
+                    is Long -> editor.putLong(destinationKey, value)
+                    is Int -> editor.putInt(destinationKey, value)
+                    is Boolean -> editor.putBoolean(destinationKey, value)
+                    is Float -> editor.putFloat(destinationKey, value)
+                }
+            }
+            val updatedExcluded = excludedSharedPaths().toMutableSet().apply {
+                removeAll(excludedToMove.toSet())
+                addAll(excludedToMove.map { newPath + it.removePrefix(oldFile.relativePath) })
+            }
+            editor.putStringSet("excluded_shared_paths", updatedExcluded)
+            editor.apply()
         }
         return renamed
     }
@@ -746,10 +802,20 @@ class ServerManager(context: Context) {
         name.isNotBlank() && name != "." && name != ".." &&
             !name.contains('/') && !name.contains('\\')
 
-    private fun resolveSharedPath(path: String?): File? {
-        val root = serverFolder.canonicalFile
-        val target = if (path.isNullOrBlank()) root else File(root, path).canonicalFile
-        return if (target == root || target.path.startsWith(root.path + File.separator)) target else null
+    private fun resolveSharedPath(path: String?): SharedFile? {
+        val root = requireSharedFolder()
+        if (path.isNullOrBlank()) return SharedFile(root, "")
+
+        val segments = path.split('/')
+        if (segments.any { !isValidChildName(it) || it.startsWith(TEMP_UPLOAD_PREFIX) }) return null
+        var current = root
+        var relativePath = ""
+        for (segment in segments) {
+            if (!current.isDirectory) return null
+            current = current.findFile(segment) ?: return null
+            relativePath = if (relativePath.isEmpty()) segment else "$relativePath/$segment"
+        }
+        return SharedFile(current, relativePath)
     }
 
     fun addApi(path: String, response: String) {
@@ -761,5 +827,9 @@ class ServerManager(context: Context) {
 
     fun removeApi(path: String) {
         _customApis.value = _customApis.value.filter { it.path != path }
+    }
+
+    companion object {
+        private const val TEMP_UPLOAD_PREFIX = ".servermobile-upload-"
     }
 }

@@ -94,7 +94,12 @@ fun MainScreen(
                 onToggleGlobal = onToggleGlobal
             )
             
-            QuickAccessGrid(logs = logs, devices = devices, serverManager = serverManager)
+            QuickAccessGrid(
+                logs = logs,
+                devices = devices,
+                serverManager = serverManager,
+                isServerActive = anyServerRunning || isLocalServerTransitioning
+            )
         }
         } else if (currentTab == 1) {
             ClientScreenContent(

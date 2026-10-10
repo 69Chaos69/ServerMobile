@@ -23,7 +23,12 @@ import com.example.servermobile.ServerManager
 import com.example.servermobile.ui.theme.*
 
 @Composable
-fun QuickAccessGrid(logs: List<String>, devices: Set<String>, serverManager: ServerManager) {
+fun QuickAccessGrid(
+    logs: List<String>,
+    devices: Set<String>,
+    serverManager: ServerManager,
+    isServerActive: Boolean
+) {
     val context = LocalContext.current
     var showLogsDialog by remember { mutableStateOf(false) }
     var showDevicesDialog by remember { mutableStateOf(false) }
@@ -53,7 +58,11 @@ fun QuickAccessGrid(logs: List<String>, devices: Set<String>, serverManager: Ser
     }
 
     if (showFilesDialog) {
-        FilesManagerDialog(serverManager = serverManager, onDismiss = { showFilesDialog = false })
+        FilesManagerDialog(
+            serverManager = serverManager,
+            isServerActive = isServerActive,
+            onDismiss = { showFilesDialog = false }
+        )
     }
 
     if (showApiDialog) {

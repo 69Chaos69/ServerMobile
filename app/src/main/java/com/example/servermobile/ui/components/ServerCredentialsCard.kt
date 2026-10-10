@@ -75,7 +75,7 @@ fun ServerCredentialsCard(
             )
             Text(
                 text = if (isServerRunning) {
-                    "Compartilhe a chave e receba a oferta gerada pelo cliente. A oferta e a resposta precisam ser trocadas por outro canal."
+                    "Compartilhe a chave e receba a oferta gerada pelo cliente. A oferta e a resposta precisam ser trocadas por outro canal. STUN usa um servidor do Google."
                 } else {
                     "Ative o servidor P2P para receber uma oferta de conexão."
                 },

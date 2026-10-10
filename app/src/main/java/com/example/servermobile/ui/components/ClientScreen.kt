@@ -78,7 +78,6 @@ fun ClientScreenContent(
     var error by remember { mutableStateOf<String?>(null) }
     var isPreparingOffer by remember { mutableStateOf(false) }
     val torrentDiscoveryManager = remember(context) { TorrentDiscoveryManager(context) }
-    var torrentDiscoveryError by remember { mutableStateOf<String?>(null) }
     val currentManager by rememberUpdatedState(clientManager)
     val connectionState by clientManager?.connectionState?.collectAsState()
         ?: remember { mutableStateOf("Desconectado") }
@@ -93,14 +92,6 @@ fun ClientScreenContent(
 
     DisposableEffect(torrentDiscoveryManager) {
         onDispose { torrentDiscoveryManager.close() }
-    }
-
-    androidx.compose.runtime.LaunchedEffect(torrentDiscoveryManager) {
-        try {
-            torrentDiscoveryManager.start()
-        } catch (e: Exception) {
-            torrentDiscoveryError = e.message ?: "Não foi possível iniciar a descoberta BitTorrent."
-        }
     }
 
     Column(
@@ -253,7 +244,7 @@ fun ClientScreenContent(
         }
 
         Text(
-            text = "A sinalização é manual e a conexão usa STUN. A oferta pode revelar endereços de rede; envie-a somente à pessoa certa. Redes com NAT restritivo podem exigir TURN.",
+            text = "A sinalização é manual e a conexão consulta o servidor STUN do Google. A oferta pode revelar endereços de rede; envie-a somente à pessoa certa. Redes com NAT restritivo podem exigir TURN.",
             color = TextSecondary,
             fontSize = 12.sp
         )
@@ -269,12 +260,12 @@ fun ClientScreenContent(
                 }
             }
 
-            TorrentDiscoveryPanel(
-                discoveryManager = torrentDiscoveryManager,
-                serverManager = serverManager,
-                startupError = torrentDiscoveryError
-            )
         }
+
+        TorrentDiscoveryPanel(
+            discoveryManager = torrentDiscoveryManager,
+            serverManager = serverManager
+        )
     }
 }
 

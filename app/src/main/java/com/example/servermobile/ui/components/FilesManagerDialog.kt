@@ -23,21 +23,31 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.DialogProperties
 import com.example.servermobile.ServerManager
+import com.example.servermobile.SharedFile
 import com.example.servermobile.ui.theme.*
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import java.io.File
 
 @Composable
-fun FilesManagerDialog(serverManager: ServerManager, onDismiss: () -> Unit) {
+fun FilesManagerDialog(
+    serverManager: ServerManager,
+    isServerActive: Boolean,
+    onDismiss: () -> Unit
+) {
     val context = LocalContext.current
     val coroutineScope = rememberCoroutineScope()
-    var files by remember { mutableStateOf(emptyList<File>()) }
-    var fileToRename by remember { mutableStateOf<File?>(null) }
+    var files by remember { mutableStateOf(emptyList<SharedFile>()) }
+    var fileToRename by remember { mutableStateOf<SharedFile?>(null) }
+    var fileError by remember { mutableStateOf<String?>(null) }
 
     suspend fun refreshFiles() {
-        files = withContext(Dispatchers.IO) { serverManager.getLocalFiles() }
+        try {
+            files = withContext(Dispatchers.IO) { serverManager.getLocalFiles() }
+            fileError = null
+        } catch (error: Exception) {
+            fileError = error.message ?: "Não foi possível listar a pasta compartilhada."
+        }
     }
 
     LaunchedEffect(serverManager) { refreshFiles() }
@@ -56,7 +66,7 @@ fun FilesManagerDialog(serverManager: ServerManager, onDismiss: () -> Unit) {
                 } else {
                     Toast.makeText(
                         context,
-                        "Não foi possível usar essa pasta. Escolha uma pasta do armazenamento do dispositivo.",
+                        "Não foi possível usar essa pasta. Escolha outra pasta com acesso de leitura e gravação.",
                         Toast.LENGTH_LONG
                     ).show()
                 }
@@ -85,7 +95,7 @@ fun FilesManagerDialog(serverManager: ServerManager, onDismiss: () -> Unit) {
                         maxLines = 2
                     )
                     Text(
-                        text = "Uploads do PC: Downloads/ServerMobile",
+                        text = "Uploads do PC: raiz da pasta compartilhada",
                         color = TextSecondary,
                         fontSize = 12.sp,
                         maxLines = 1
@@ -96,9 +106,19 @@ fun FilesManagerDialog(serverManager: ServerManager, onDismiss: () -> Unit) {
                         fontSize = 12.sp,
                         maxLines = 2
                     )
+                    if (isServerActive) {
+                        Text(
+                            "Pare os servidores antes de trocar a pasta compartilhada.",
+                            color = TextSecondary,
+                            fontSize = 12.sp
+                        )
+                    }
                 }
                 Row {
-                    IconButton(onClick = { sharedFolderPickerLauncher.launch(null) }) {
+                    IconButton(
+                        onClick = { sharedFolderPickerLauncher.launch(null) },
+                        enabled = !isServerActive
+                    ) {
                         Icon(
                             Icons.Filled.FolderOpen,
                             contentDescription = "Escolher pasta compartilhada",
@@ -109,7 +129,9 @@ fun FilesManagerDialog(serverManager: ServerManager, onDismiss: () -> Unit) {
             }
         },
         text = {
-            if (files.isEmpty()) {
+            if (fileError != null) {
+                Text(fileError.orEmpty(), color = TextSecondary)
+            } else if (files.isEmpty()) {
                 Text("Nenhum arquivo encontrado.", color = TextSecondary)
             } else {
                 LazyColumn(modifier = Modifier.fillMaxSize()) {
@@ -202,10 +224,10 @@ fun FilesManagerDialog(serverManager: ServerManager, onDismiss: () -> Unit) {
 }
 
 @Composable
-fun FileItemRow(file: File, onDelete: (Boolean) -> Unit, onRenameRequest: () -> Unit) {
+fun FileItemRow(file: SharedFile, onDelete: (Boolean) -> Unit, onRenameRequest: () -> Unit) {
     var expanded by remember { mutableStateOf(false) }
     var confirmDelete by remember { mutableStateOf(false) }
-    var deleteFromStorage by remember(file.path) { mutableStateOf(false) }
+    var deleteFromStorage by remember(file.relativePath) { mutableStateOf(false) }
 
     Row(
         modifier = Modifier

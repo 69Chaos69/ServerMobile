@@ -8,7 +8,6 @@ object FrontendUI {
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Server Mobile</title>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600&display=swap" rel="stylesheet">
     <style>
         :root {
             --bg-color: #0f172a;
@@ -19,7 +18,7 @@ object FrontendUI {
             --accent-hover: #2563eb;
         }
         body {
-            margin: 0; padding: 0; font-family: 'Inter', sans-serif;
+            margin: 0; padding: 0; font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
             background: linear-gradient(135deg, #0f172a 0%, #1e1b4b 100%);
             color: var(--text-color); min-height: 100vh;
             display: flex; flex-direction: column; align-items: center;
@@ -440,7 +439,7 @@ object FrontendUI {
             await fetchFiles();
             uploadStatus.textContent = failures.length
                 ? uploaded + ' arquivo(s) enviado(s); falha(s): ' + failures.join(' | ')
-                : uploaded + ' arquivo(s) enviado(s) para Downloads/ServerMobile.';
+                : uploaded + ' arquivo(s) enviado(s) para a pasta compartilhada.';
         });
 
         fetchFiles();

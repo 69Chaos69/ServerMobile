@@ -23,6 +23,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
 import java.io.File
+import java.util.concurrent.ConcurrentHashMap
 
 data class TorrentTransfer(
     val infoHash: String,
@@ -51,6 +52,7 @@ class TorrentDiscoveryManager(context: Context) {
     private var multicastLock: WifiManager.MulticastLock? = null
     private var refreshJob: Job? = null
     private val lifecycleLock = Any()
+    private val seededDirectories = ConcurrentHashMap<String, File>()
     @Volatile private var closed = false
     private var starting = false
     @Volatile private var started = false
@@ -199,30 +201,47 @@ class TorrentDiscoveryManager(context: Context) {
     private fun magnetTopic(magnetUri: String): String =
         Uri.parse(magnetUri).getQueryParameter("xt").orEmpty()
 
-    suspend fun createAndSeed(file: File): String = withContext(Dispatchers.IO) {
+    suspend fun createAndSeed(file: SharedFile, serverManager: ServerManager): String = withContext(Dispatchers.IO) {
         check(started) { "Inicie a descoberta antes de criar um magnet." }
-        require(file.exists() && (file.isFile || file.isDirectory)) { "O item compartilhado não existe." }
-        require(file.length() != 0L || file.isDirectory) { "Não é possível compartilhar um arquivo vazio." }
-        val result = TorrentBuilder()
-            .path(file)
-            .creator("ServerMobile")
-            .listener(object : TorrentBuilder.Listener {
-                override fun accept(filename: String): Boolean =
-                    !File(filename).name.startsWith(".")
+        require(
+            file.name.isNotBlank() && file.name != "." && file.name != ".." &&
+                !file.name.contains('/') && !file.name.contains('\\')
+        ) { "O nome do item compartilhado não é válido." }
+        val stagingDirectory = File(
+            appContext.filesDir,
+            "torrent-seeds/${java.util.UUID.randomUUID()}"
+        )
+        val stagedItem = File(stagingDirectory, file.name)
+        try {
+            serverManager.copyToPrivateFile(file, stagedItem)
+            require(stagedItem.isDirectory || stagedItem.length() > 0L) {
+                "Não é possível compartilhar um arquivo vazio."
+            }
+            val result = TorrentBuilder()
+                .path(stagedItem)
+                .creator("ServerMobile")
+                .listener(object : TorrentBuilder.Listener {
+                    override fun accept(filename: String): Boolean =
+                        !File(filename).name.startsWith(".")
 
-                override fun progress(pieceIndex: Int, numPieces: Int) {}
-            })
-            .generate()
-        val torrentInfo = com.frostwire.jlibtorrent.TorrentInfo(result.entry().bencode())
-        val magnetUri = torrentInfo.makeMagnetUri()
-        check(!magnetUri.isNullOrBlank()) { "Não foi possível gerar o magnet." }
-        sessionManager.download(torrentInfo, file.absoluteFile.parentFile)
-        magnetUri
+                    override fun progress(pieceIndex: Int, numPieces: Int) {}
+                })
+                .generate()
+            val torrentInfo = com.frostwire.jlibtorrent.TorrentInfo(result.entry().bencode())
+            val magnetUri = torrentInfo.makeMagnetUri()
+            check(!magnetUri.isNullOrBlank()) { "Não foi possível gerar o magnet." }
+            sessionManager.download(torrentInfo, stagingDirectory)
+            seededDirectories[magnetTopic(magnetUri).lowercase()] = stagingDirectory
+            magnetUri
+        } catch (error: Throwable) {
+            stagingDirectory.deleteRecursively()
+            throw error
+        }
     }
 
     suspend fun removeTransfer(infoHash: String) = withContext(Dispatchers.IO) {
-        val handle = findHandle(infoHash) ?: return@withContext
-        sessionManager.remove(handle)
+        findHandle(infoHash)?.let(sessionManager::remove)
+        seededDirectories.remove(infoHash.lowercase())?.deleteRecursively()
         refreshTransfers()
     }
 
@@ -244,6 +263,8 @@ class TorrentDiscoveryManager(context: Context) {
                     sessionManager.stop()
                 } finally {
                     if (activeMulticastLock?.isHeld == true) activeMulticastLock.release()
+                    seededDirectories.values.forEach { it.deleteRecursively() }
+                    seededDirectories.clear()
                 }
             }
         } else if (!startPending) {

@@ -48,13 +48,13 @@ class ServerService : Service() {
 
         val notification: Notification = NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("Servidores Ativos")
-            .setContentText("O servidor está rodando em segundo plano de forma permanente.")
+            .setContentText("O servidor está ativo em segundo plano.")
             .setSmallIcon(android.R.drawable.stat_sys_download_done)
             .setContentIntent(pendingIntent)
             .setOngoing(true)
             .build()
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
             startForeground(
                 NOTIFICATION_ID, 
                 notification, 
@@ -64,7 +64,7 @@ class ServerService : Service() {
             startForeground(NOTIFICATION_ID, notification)
         }
 
-        return START_STICKY
+        return START_NOT_STICKY
     }
 
     override fun onBind(intent: Intent?): IBinder? {
@@ -76,7 +76,7 @@ class ServerService : Service() {
             val serviceChannel = NotificationChannel(
                 CHANNEL_ID,
                 "Servidor Mobile Service Channel",
-                NotificationManager.IMPORTANCE_DEFAULT
+                NotificationManager.IMPORTANCE_LOW
             )
             val manager = getSystemService(NotificationManager::class.java)
             manager?.createNotificationChannel(serviceChannel)

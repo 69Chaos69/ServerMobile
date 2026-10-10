@@ -45,6 +45,7 @@ import androidx.compose.ui.text.input.KeyboardCapitalization
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.servermobile.ServerManager
+import com.example.servermobile.SharedFile
 import com.example.servermobile.TorrentDiscoveryManager
 import com.example.servermobile.TorrentTransfer
 import com.example.servermobile.ui.theme.CardBackground
@@ -61,21 +62,22 @@ import java.io.InputStream
 @Composable
 fun TorrentDiscoveryPanel(
     discoveryManager: TorrentDiscoveryManager,
-    serverManager: ServerManager,
-    startupError: String?
+    serverManager: ServerManager
 ) {
     val context = LocalContext.current
     val clipboardManager = LocalClipboardManager.current
     val coroutineScope = rememberCoroutineScope()
     val transfers by discoveryManager.transfers.collectAsState()
     val networkStatus by discoveryManager.networkStatus.collectAsState()
-    var localFiles by remember { mutableStateOf(emptyList<java.io.File>()) }
+    var localFiles by remember { mutableStateOf(emptyList<SharedFile>()) }
     var magnetInput by remember { mutableStateOf("") }
     var generatedMagnet by remember { mutableStateOf("") }
     var error by remember { mutableStateOf<String?>(null) }
     var busyFilePath by remember { mutableStateOf<String?>(null) }
     var isAddingMagnet by remember { mutableStateOf(false) }
     var isImportingFile by remember { mutableStateOf(false) }
+    var isStartingDiscovery by remember { mutableStateOf(false) }
+    var discoveryStarted by remember { mutableStateOf(false) }
     var pendingConnectionFile by remember { mutableStateOf("") }
 
     val importFileLauncher = rememberLauncherForActivityResult(
@@ -125,7 +127,11 @@ fun TorrentDiscoveryPanel(
     }
 
     LaunchedEffect(serverManager) {
-        localFiles = withContext(Dispatchers.IO) { serverManager.getLocalFiles() }
+        try {
+            localFiles = withContext(Dispatchers.IO) { serverManager.getLocalFiles() }
+        } catch (e: Exception) {
+            error = e.message ?: "Não foi possível listar a pasta compartilhada."
+        }
     }
 
     Card(
@@ -140,13 +146,42 @@ fun TorrentDiscoveryPanel(
             Text("Descoberta BitTorrent", fontSize = 18.sp, fontWeight = FontWeight.Bold, color = TextPrimary)
             Text(networkStatus, color = TextSecondary, fontSize = 13.sp)
             Text(
-                "Use um magnet para encontrar peers do mesmo torrent: DHT funciona pela internet, LSD na rede local e PEX repassa peers já encontrados.",
+                "A descoberta BitTorrent só começa quando você tocar em Iniciar. Ela usa DHT pela internet e LSD na rede local.",
+                color = TextSecondary,
+                fontSize = 12.sp
+            )
+            Text(
+                "Ao criar um magnet, o item selecionado é copiado para o armazenamento privado do app e pode ocupar espaço adicional.",
                 color = TextSecondary,
                 fontSize = 12.sp
             )
             Button(
+                onClick = {
+                    coroutineScope.launch {
+                        isStartingDiscovery = true
+                        error = null
+                        try {
+                            discoveryManager.start()
+                            discoveryStarted = true
+                        } catch (e: Exception) {
+                            error = e.message ?: "Não foi possível iniciar a descoberta BitTorrent."
+                        } finally {
+                            isStartingDiscovery = false
+                        }
+                    }
+                },
+                enabled = !discoveryStarted && !isStartingDiscovery,
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                if (isStartingDiscovery) {
+                    CircularProgressIndicator()
+                } else {
+                    Text(if (discoveryStarted) "Descoberta ativa" else "Iniciar descoberta BitTorrent")
+                }
+            }
+            Button(
                 onClick = { importFileLauncher.launch(arrayOf("*/*")) },
-                enabled = !isImportingFile,
+                enabled = discoveryStarted && !isImportingFile,
                 modifier = Modifier.fillMaxWidth()
             ) {
                 if (isImportingFile) {
@@ -159,7 +194,7 @@ fun TorrentDiscoveryPanel(
                 value = magnetInput,
                 onValueChange = { magnetInput = it },
                 label = { Text("Magnet link") },
-                enabled = !isAddingMagnet,
+                enabled = discoveryStarted && !isAddingMagnet,
                 minLines = 2,
                 maxLines = 4,
                 keyboardOptions = KeyboardOptions(capitalization = KeyboardCapitalization.None),
@@ -186,7 +221,7 @@ fun TorrentDiscoveryPanel(
                         }
                     }
                 },
-                enabled = magnetInput.isNotBlank() && !isAddingMagnet,
+                enabled = discoveryStarted && magnetInput.isNotBlank() && !isAddingMagnet,
                 modifier = Modifier.fillMaxWidth()
             ) {
                 if (isAddingMagnet) {
@@ -207,11 +242,11 @@ fun TorrentDiscoveryPanel(
                             Button(
                                 onClick = {
                                     coroutineScope.launch {
-                                        busyFilePath = file.absolutePath
+                                        busyFilePath = file.relativePath
                                         error = null
                                         generatedMagnet = ""
                                         try {
-                                            generatedMagnet = discoveryManager.createAndSeed(file)
+                                            generatedMagnet = discoveryManager.createAndSeed(file, serverManager)
                                         } catch (e: Exception) {
                                             error = e.message ?: "Não foi possível publicar este item."
                                         } finally {
@@ -219,11 +254,11 @@ fun TorrentDiscoveryPanel(
                                         }
                                     }
                                 },
-                                enabled = busyFilePath == null,
+                                enabled = discoveryStarted && busyFilePath == null,
                                 contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp),
                                 modifier = Modifier.weight(1f)
                             ) {
-                                if (busyFilePath == file.absolutePath) {
+                                if (busyFilePath == file.relativePath) {
                                     CircularProgressIndicator()
                                 } else {
                                     Text("Criar magnet")
@@ -232,10 +267,10 @@ fun TorrentDiscoveryPanel(
                             Button(
                                 onClick = {
                                     coroutineScope.launch {
-                                        busyFilePath = file.absolutePath
+                                        busyFilePath = file.relativePath
                                         error = null
                                         try {
-                                            val magnet = discoveryManager.createAndSeed(file)
+                                            val magnet = discoveryManager.createAndSeed(file, serverManager)
                                             pendingConnectionFile =
                                                 discoveryManager.createConnectionFile(file.name, magnet)
                                             val safeName = file.name
@@ -249,7 +284,7 @@ fun TorrentDiscoveryPanel(
                                         }
                                     }
                                 },
-                                enabled = busyFilePath == null,
+                                enabled = discoveryStarted && busyFilePath == null,
                                 contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp),
                                 modifier = Modifier.weight(1f)
                             ) {
@@ -289,7 +324,6 @@ fun TorrentDiscoveryPanel(
                 }
             }
 
-            startupError?.let { Text(it, color = ErrorRed, fontSize = 13.sp) }
             error?.let { Text(it, color = ErrorRed, fontSize = 13.sp) }
 
             transfers.forEach { transfer ->
