@@ -22,6 +22,6 @@ Repo: https://github.com/69Chaos69/ServerMobile.git
 Builds:
   - versionName: '1.0'
     versionCode: 1
-    commit: af400b80b84d75f7753a8cf5bdaee7dc35ff4547
+    commit: d0fe7abc6b77dd4bc2f9fa6486226531c26e1f9d
     gradle:
       - yes
