@@ -19,7 +19,7 @@ object AppLogger {
 
     fun init(context: Context) {
         try {
-            // Salva no diretório de arquivos externos do app: Android/data/com.example.servermobile/files/
+            // Salva no diretório externo privado do app.
             val dir = context.getExternalFilesDir(null)
             if (dir != null && !dir.exists()) {
                 dir.mkdirs()

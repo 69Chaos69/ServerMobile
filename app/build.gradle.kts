@@ -9,7 +9,7 @@ android {
     compileSdk = 37
 
     defaultConfig {
-        applicationId = "com.example.servermobile"
+        applicationId = "io.github.x69chaos69.servermobile"
         minSdk = 26
         targetSdk = 36
         versionCode = 1
