@@ -1,0 +1,15 @@
+.gradle/
+.kotlin/
+.idea/
+/build/
+**/build/
+local.properties
+temp_sources/
+
+.cxx/
+.externalNativeBuild/
+captures/
+
+*.jks
+*.keystore
+keystore.properties
